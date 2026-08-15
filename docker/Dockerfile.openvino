@@ -1,0 +1,52 @@
+# Stage 1: build the binary
+FROM golang:1.25-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN VERSION=$(cat VERSION.md 2>/dev/null | tr -d '[:space:]') && \
+    REPO=$(cat REPOSITORY.md 2>/dev/null | tr -d '[:space:]') && \
+    DOC=$(cat DOC.md 2>/dev/null | tr -d '[:space:]') && \
+    CGO_ENABLED=1 go build -tags tagger \
+    -ldflags="-s -w -X 'github.com/monbooru/monbooru/internal/web.Version=${VERSION}' -X 'github.com/monbooru/monbooru/internal/web.RepoURL=${REPO}' -X 'github.com/monbooru/monbooru/internal/web.DocURL=${DOC}' -X 'github.com/monbooru/monbooru/internal/web.Variant=openvino'" \
+    -o /monbooru ./cmd/monbooru
+
+
+# Stage 2: runtime image based on OpenVINO
+FROM openvino/ubuntu22_runtime:latest
+USER root
+COPY --from=build /monbooru /usr/local/bin/monbooru
+
+# Install ffmpeg
+ARG FFMPEG_RELEASE=n8.1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl xz-utils && \
+    curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-${FFMPEG_RELEASE}-latest-linux64-gpl-${FFMPEG_RELEASE#n}.tar.xz" -o /tmp/ffmpeg.tar.xz && \
+    mkdir -p /tmp/ff && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ff --strip-components=1 && \
+    cp /tmp/ff/bin/ffmpeg /tmp/ff/bin/ffprobe /usr/local/bin/ && \
+    apt-get purge -y curl xz-utils && apt-get autoremove -y && \
+    rm -rf /tmp/onnxruntime-* /tmp/ff /tmp/ffmpeg.tar.xz /var/lib/apt/lists/*
+
+# Install onnxruntime-openvino and create symlink for onnxruntime
+RUN pip install --no-cache-dir onnxruntime-openvino && \
+    # Create symlinks for all .so and .so.* files in onnxruntime-openvino to /usr/local/lib
+    PKG_DIR=$(python3 -c "import onnxruntime, os; print(os.path.dirname(onnxruntime.__file__))") && \
+    find "$PKG_DIR" -name "*.so*" -type f -exec ln -sf {} /usr/local/lib/ \; && \
+    ORT_FILE=$(find "$PKG_DIR" -name "libonnxruntime.so.*" | head -1) && \
+    if [ -n "$ORT_FILE" ]; then ln -sf "$ORT_FILE" /usr/local/lib/libonnxruntime.so; fi && \
+    ldconfig
+
+# Prepare home directory for non-root user (Default: /home/openvino)
+RUN mkdir -p /home/monbooru && chown 1000:1000 /home/monbooru
+
+USER 1000:1000
+
+ENV HOME=/home/monbooru \
+    MONBOORU_SERVER_BIND_ADDRESS=0.0.0.0:8080
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/monbooru", "healthcheck", "-config", "/config/monbooru.toml"]
+
+ENTRYPOINT ["/usr/local/bin/monbooru", "-config", "/config/monbooru.toml"]
